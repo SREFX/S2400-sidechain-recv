@@ -6,26 +6,92 @@
 START_NAMESPACE_DISTRHO
 
 SCReceive::SCReceive()
-    : Plugin(DISTRHO_PLUGIN_NUM_PARAMS, 0, 0)
+    : Plugin(DISTRHO_PLUGIN_NUM_PARAMS, 0, 0),
+    fBusParam(0.0f)
 {
-    // open shared RAM block as read only
-    fSharedFd = shm_open("/s2400_sb", O_RDONLY, 0666);
-    
-    if (fSharedFd >= 0) {
-        // map to pointer
-        fSharedControl = (float*)mmap(0, sizeof(float) * 2, PROT_READ, MAP_SHARED, fSharedFd, 0);
-    } else {
-        fSharedControl = (float*)MAP_FAILED;
+    // define 4 memory bus names
+    const char* busNames[4] = {"/sidechain_bus_a", "/sidechain_bus_b", "/sidechain_bus_c", "/sidechain_bus_d"};
+
+    // loop through and open all 4 busses
+    for (int i = 0; i < 4; ++i) {
+        // ask linux kernel to create/open a shared block of RAM
+        fSharedFds[i] = shm_open(busNames[i], O_CREAT | O_RDWR, 0666);
+
+        if (fSharedFds[i] >= 0) {
+            // set the size to exactly 2 floats (8 bytes)
+            ftruncate(fSharedFds[i], sizeof(StereoSidechain));
+
+            // map that memory directly to pointer
+            fBuses[i] = (StereoSidechain*)mmap(0, sizeof(StereoSidechain), PROT_READ | PROT_WRITE, MAP_SHARED, fSharedFds[i], 0);
+
+            // init volume to 1.0 so SCRecv isn't muted by default
+            if (fBuses[i] != (StereoSidechain*)MAP_FAILED) {
+                fBuses[i]->left = 1.0f;
+                fBuses[i]->right = 1.0f;
+            }
+        } else {
+            fBuses[i] = (StereoSidechain*)MAP_FAILED;
+        }
     }
 }
 
 SCReceive::~SCReceive() {
-    // close memory safely when plugin is deleted
-    if (fSharedControl != (float*)MAP_FAILED) {
-        munmap(fSharedControl, sizeof(float)* 2);
+    // loop through and safely close all four buses
+    for (int i = 0; i < 4; ++i) {
+        // unlink and close memory safely when deleted
+        if (fBuses[i] != (StereoSidechain*)MAP_FAILED) {
+            munmap(fBuses[i], sizeof(StereoSidechain));
+        }
+        if (fSharedFds[i] >= 0) {
+        close(fSharedFds[i]);
+        }
     }
-    if (fSharedFd >= 0) {
-        close(fSharedFd);
+}
+
+void SCReceive::initParameter(uint32_t index, Parameter& parameter) {
+    parameter.hints = kParameterIsAutomatable;
+
+    switch (index) {
+        case 0:
+        parameter.name = "Receive Bus";
+        parameter.symbol = "receiveBus";
+
+        parameter.hints = kParameterIsAutomatable | kParameterIsInteger;
+        parameter.ranges.min = 0;
+        parameter.ranges.max = 3;
+        parameter.ranges.def = 0;
+
+        parameter.enumValues.count = 4;
+        parameter.enumValues.restrictedMode = true;
+        parameter.enumValues.values = new ParameterEnumerationValue[4];
+
+        parameter.enumValues.values[0].value = 0;
+        parameter.enumValues.values[0].label = "A";
+
+        parameter.enumValues.values[1].value = 1;
+        parameter.enumValues.values[1].label = "B";
+
+        parameter.enumValues.values[2].value = 2;
+        parameter.enumValues.values[2].label = "C";
+
+        parameter.enumValues.values[3].value = 3;
+        parameter.enumValues.values[3].label = "D";
+        break;
+    }
+}
+
+float SCReceive::getParameterValue(uint32_t index) const {
+    switch (index) {
+        case 0: return fBusParam;
+        default: return 0.0f;
+    }
+}
+
+void SCReceive::setParameterValue(uint32_t index, float value) {
+    switch (index) {
+        case 0:
+        fBusParam = value;
+        break;
     }
 }
 
@@ -36,20 +102,24 @@ void SCReceive::run(const float** inputs, float** outputs, uint32_t frames) {
     float* outL = outputs[0]; 
     bool hasRightOutput = (outputs[1] != nullptr);
 
-    // fetch vol from SCSend, default to 1.0 if failure
-    float incomingL = 1.0f;
-    float incomingR = 1.0f;
+    // incoming bus
+    int currentBus = (int)fBusParam;
 
-    if (fSharedControl != (float*)MAP_FAILED) {
-        incomingL = fSharedControl[0];
-        incomingR = fSharedControl[1];
-    }
+    // fetch vol from SCSend, default to 1.0 if failure
+    float scSignalL = 1.0f;
+    float scSignalR = 1.0f;
+
+    // read from active bus
+    if (fBuses[currentBus] != (StereoSidechain*)MAP_FAILED) {
+    scSignalL = fBuses[currentBus]->left;
+    scSignalR = fBuses[currentBus]->right;
+}
 
     // mult volume by SCSend values from RAM
     for (uint32_t i = 0; i < frames; ++i) {
-        outL[i] = inL[i] * incomingL;
+        outL[i] = inL[i] * scSignalL;
         if (hasRightOutput) {
-            outputs[1][i] = inR[i] * incomingR;
+            outputs[1][i] = inR[i] * scSignalR;
         }
     }
 }
